@@ -5,6 +5,7 @@
     "": {
       "name": "localsync",
       "dependencies": {
+        "ignore": "5.3.2",
         "pushwork": "2.2.3",
       },
     },

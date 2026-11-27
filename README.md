@@ -61,6 +61,23 @@ From then on either machine can `add` or `rm` folders, because the list of
 folders syncs too. `localsync ls` shows each folder and where it lives on this
 machine.
 
+### Ignoring paths
+
+Put a `.syncignore` at the top of a synced folder. It uses gitignore syntax and
+syncs like any other file, so every machine follows the same rules:
+
+```gitignore
+# ~/.claude/.syncignore
+projects/
+todos/
+*.log
+```
+
+An ignored path is left alone on every machine: it isn't pushed, pulled or
+deleted. Files that already synced before you ignored them leave the shared
+copy, and each machine keeps its own local copy. If you remove a rule, it takes
+effect one sync later.
+
 ## Commands
 
 | Command | Effect |
@@ -99,7 +116,8 @@ Settings via environment: `LOCALSYNC_PORT` (18081), `LOCALSYNC_DEBOUNCE_MS`
   one added later is ignored there until it's remapped.
 - If an incoming change would overwrite a local edit that hasn't synced yet,
   the local copy goes to `~/.localsync/backup/` first.
-- `.git`, `node_modules`, `.DS_Store` and `*.tmp` are skipped.
+- `.git`, `node_modules`, `.DS_Store` and `*.tmp` are always skipped, plus
+  whatever each folder's `.syncignore` lists.
 
 ## Security
 
@@ -120,11 +138,12 @@ Don't sync folders that hold secrets you wouldn't want on every device.
 
 ## Dependencies
 
-Neither is vendored into this repo. `bun install` fetches pushwork, and the host downloads Subduction on first start.
+None is vendored into this repo. `bun install` fetches the npm packages, and the host downloads Subduction on first start.
 
 | Dependency | How it's used | License |
 | --- | --- | --- |
 | [pushwork](https://www.npmjs.com/package/pushwork) | npm dependency pinned to `2.2.3` (`bun install`). localsync runs its CLI under Bun | MIT OR Apache-2.0 |
+| [ignore](https://www.npmjs.com/package/ignore) | npm dependency pinned to `5.3.2`. Matches `.syncignore` patterns | MIT |
 | [Subduction](https://github.com/inkandswitch/subduction) | The host downloads a pinned nightly (`v0.22.0-nightly.2026-11-26`) to `~/.local/bin/subduction` | MIT OR Apache-2.0 |
 
 ## License

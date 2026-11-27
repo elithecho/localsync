@@ -22,6 +22,7 @@ import {
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import ignore, { type Ignore } from "ignore";
 
 const HOME = homedir();
 const DIR = process.env.LOCALSYNC_DIR ?? join(HOME, ".localsync");
@@ -268,17 +269,51 @@ type Listing = Map<string, string>;
 
 const skipName = (n: string) => n === ".git" || n === "node_modules" || n === ".DS_Store" || n === ".pushwork" || n.endsWith(".tmp") || n.includes(TMP);
 
-function walk(root: string, rel: string, out: Listing, kind: "home" | "store") {
+// <folder>/.syncignore (gitignore syntax) keeps paths out of the sync. It is
+// an ordinary synced file, so every machine applies the same rules. Rules are
+// the union of the local and store copies: ignoring is the safe direction
+// (an ignored path is never written, deleted or pushed), and a removed rule
+// takes effect once both copies agree, one cycle later.
+const IGNORE_FILE = ".syncignore";
+let rules = new Map<string, Ignore>(); // folder name -> rules
+
+function loadRules(entries: Entry[]) {
+  rules = new Map();
+  for (const e of entries) {
+    const lines: string[] = [];
+    for (const f of [join(HOME, e.rel, IGNORE_FILE), join(FILES, e.name, IGNORE_FILE)]) {
+      try {
+        lines.push(...readFileSync(f, "utf8").split(/\r?\n/));
+      } catch {}
+    }
+    const pats = lines.map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    if (pats.length) rules.set(e.name, ignore().add(pats));
+  }
+}
+
+// key = "<name>/<path inside the folder>"; dir adds the trailing slash that "logs/" patterns need.
+function ignored(key: string, dir = false) {
+  const i = key.indexOf("/");
+  const ig = i > 0 ? rules.get(key.slice(0, i)) : undefined;
+  return !!ig && ig.ignores(key.slice(i + 1) + (dir ? "/" : ""));
+}
+
+// toKey maps a walked path to its key; returning undefined means "not inside a folder".
+function walk(root: string, rel: string, out: Listing, kind: "home" | "store", toKey: (rel: string) => string, raw = false) {
   const p = rel ? join(root, rel) : root;
   if (rel && skipName(basename(rel))) return;
   const st = lstatSync(p, { throwIfNoEntry: false });
   if (!st) return;
+  if (rel && !raw) {
+    const k = toKey(kind === "store" && rel.endsWith(LINK) ? rel.slice(0, -LINK.length) : rel);
+    if (ignored(k, st.isDirectory() && !st.isSymbolicLink())) return;
+  }
   if (st.isSymbolicLink()) {
     if (kind === "home") out.set(rel, "L:" + tilde(readlinkSync(p)));
     return; // the store never holds real symlinks
   }
   if (st.isDirectory()) {
-    for (const name of readdirSync(p)) walk(root, rel ? join(rel, name) : name, out, kind);
+    for (const name of readdirSync(p)) walk(root, rel ? join(rel, name) : name, out, kind, toKey, raw);
   } else if (st.isFile()) {
     if (kind === "store" && rel.endsWith(LINK)) out.set(rel.slice(0, -LINK.length), "L:" + readFileSync(p, "utf8").trim());
     else out.set(rel, "F:" + Bun.hash(readFileSync(p)).toString(36));
@@ -290,7 +325,7 @@ function listHome(entries: Entry[]): Listing {
   const out: Listing = new Map();
   for (const e of entries) {
     const tmp: Listing = new Map();
-    walk(HOME, e.rel, tmp, "home");
+    walk(HOME, e.rel, tmp, "home", (rel) => e.name + rel.slice(e.rel.length));
     for (const [rel, v] of tmp) out.set(e.name + rel.slice(e.rel.length), v);
   }
   return out;
@@ -305,10 +340,10 @@ function homeRel(key: string) {
   return e.rel + key.slice(name.length);
 }
 
-// Everything in the store, or only the given folders.
-function listStore(names?: Set<string>): Listing {
+// Everything in the store, or only the given folders. raw includes ignored paths.
+function listStore(names?: Set<string>, raw = false): Listing {
   const out: Listing = new Map();
-  walk(FILES, "", out, "store");
+  walk(FILES, "", out, "store", (rel) => rel, raw);
   if (names) for (const k of out.keys()) if (!under(k, names)) out.delete(k);
   return out;
 }
@@ -425,6 +460,7 @@ const baseNames = (base: Listing) => new Set([...base.keys()].map(nameOf));
 // ~ -> store: what changed locally since the baseline.
 function exportLocal(entries: Entry[], base: Listing): string[] {
   current = entries;
+  loadRules(entries);
   const names = new Set(entries.map((e) => e.name));
   const known = baseNames(base);
   const local = listHome(entries);
@@ -434,7 +470,10 @@ function exportLocal(entries: Entry[], base: Listing): string[] {
     const push = known.has(nameOf(k)) ? base.get(k) !== v : !store.has(k);
     if (push) (toStore(k, v), changed.push(k));
   }
-  for (const k of base.keys()) if (under(k, names) && !local.has(k)) (dropFromStore(k), changed.push("-" + k));
+  for (const k of base.keys()) if (under(k, names) && !local.has(k) && !ignored(k)) (dropFromStore(k), changed.push("-" + k));
+  // Newly ignored files leave the store. Peers apply the same rules, so they
+  // read this as "ignored", not "deleted", and keep their own copies.
+  for (const k of listStore(names, true).keys()) if (ignored(k)) (dropFromStore(k), changed.push("~" + k));
   return changed;
 }
 
@@ -537,8 +576,9 @@ async function cycle(reason: string) {
     await pushworkSync();
     syncMs = Date.now() - t0;
     const entries = activeEntries();
+    loadRules(entries); // the sync may have brought a new .syncignore
     const names = new Set(entries.map((e) => e.name));
-    const before = new Map([...rawBefore].filter(([k]) => under(k, names)));
+    const before = new Map([...rawBefore].filter(([k]) => under(k, names) && !ignored(k)));
     const after = listStore(names);
     const inn = importRemote(entries, before, after, base);
     writeFileSync(BASELINE, JSON.stringify(Object.fromEntries(listStore(names))));
@@ -575,9 +615,9 @@ function onChange() {
 // One watcher per registered path; a file is watched through its parent so
 // atomic rename-writes still fire. exportLocal() decides what really changed.
 function rewatch(entries: Entry[]) {
-  const want = new Set(entries.map((e) => join(HOME, e.rel)));
+  const want = new Map(entries.map((e) => [join(HOME, e.rel), e.name]));
   for (const [p, w] of watchers) if (!want.has(p)) (w.close(), watchers.delete(p));
-  for (const p of want) {
+  for (const [p, folder] of want) {
     if (watchers.has(p) || !existsSync(p)) continue;
     const isDir = statSync(p).isDirectory();
     const only = isDir ? undefined : basename(p);
@@ -585,6 +625,7 @@ function rewatch(entries: Entry[]) {
       const w = watch(isDir ? p : dirname(p), { recursive: isDir }, (_ev, name) => {
         if (only && name !== only) return;
         if (name && String(name).includes(TMP)) return; // our own temp files
+        if (isDir && name && ignored(`${folder}/${name}`)) return; // e.g. a log that churns
         onChange();
       });
       w.on("error", () => watchers.delete(p));
