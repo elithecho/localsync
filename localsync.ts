@@ -16,8 +16,8 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import {
-  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync,
-  renameSync, rmdirSync, rmSync, statSync, symlinkSync, watch, writeFileSync, type FSWatcher,
+  chmodSync, cpSync, truncateSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync,
+  renameSync, rmdirSync, rmSync, statSync, symlinkSync, watch, writeFileSync, writeSync, type FSWatcher,
 } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
@@ -52,7 +52,9 @@ const TMP = ".localsync-tmp";
 
 type Config = { role: "host"; ip: string; dns: string; endpoint: string } | { role: "peer"; endpoint: string };
 
-const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
+// Write straight to fd 1: under launchd stdout is a file, and buffered
+// console output can sit unflushed for minutes.
+const log = (...a: unknown[]) => writeSync(1, [new Date().toISOString(), ...a].join(" ") + "\n");
 const die = (msg: string): never => {
   console.error(msg);
   process.exit(1);
@@ -239,7 +241,8 @@ async function superviseServer(ip: string, dns: string) {
     const child = spawn(
       SUBDUCTION,
       ["server", "--key-file", SERVER_KEY, "--auth", "open", "--socket", `${ip}:${PORT}`, "--data-dir", SERVER_DATA, "--service-name", `${dns}:${PORT}`],
-      { stdio: "inherit", env: { ...process.env, NO_COLOR: "1" } },
+      // Subduction logs every connection at info level: megabytes per hour.
+      { stdio: "inherit", env: { ...process.env, NO_COLOR: "1", RUST_LOG: process.env.RUST_LOG ?? "warn" } },
     );
     const stop = () => child.kill();
     process.once("exit", stop);
@@ -475,18 +478,46 @@ function pushworkBin(): string[] {
 
 function runPushwork(args: string[], cwd = STORE) {
   const [cmd, ...pre] = pushworkBin();
-  // Bounded: signals (stop) are only handled between syncs, and an unreachable
-  // server must not wedge the daemon.
+  // Bounded, so an unreachable server can't wedge the CLI.
   return spawnSync(cmd, [...pre, ...args], { cwd, encoding: "utf8", env: process.env, timeout: PUSHWORK_TIMEOUT_MS });
 }
 
-function pushworkSync() {
-  const r = runPushwork(["--quiet", "sync"]);
-  if (r.status !== 0) throw new Error(`pushwork sync failed (${r.status ?? r.error?.message}): ${`${r.stdout ?? ""}${r.stderr ?? ""}`.trim()}`);
+// The daemon's sync runs asynchronously: a sync takes seconds on a big store
+// (pushwork loads every file's doc each run), and the event loop must keep
+// collecting watch events and signals meanwhile.
+function pushworkSync(): Promise<void> {
+  const [cmd, ...pre] = pushworkBin();
+  return new Promise((ok, fail) => {
+    const child = spawn(cmd, [...pre, "--quiet", "sync"], { cwd: STORE, env: process.env });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    const timer = setTimeout(() => child.kill("SIGKILL"), PUSHWORK_TIMEOUT_MS);
+    child.on("error", (e) => (clearTimeout(timer), fail(e)));
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) ok();
+      else fail(new Error(`pushwork sync failed (${signal === "SIGKILL" ? `timed out after ${PUSHWORK_TIMEOUT_MS}ms` : code}): ${out.trim().slice(-500)}`));
+    });
+  });
 }
 
 let busy = false;
 let again = false;
+let syncMs = 0;
+let pollTimer: ReturnType<typeof setTimeout> | undefined;
+let daemonMode = false;
+
+// launchd appends stdout/stderr to LOG forever; keep it bounded.
+const LOG_MAX = 5 * 1024 * 1024;
+function capLog() {
+  try {
+    if (daemonMode && statSync(LOG).size > LOG_MAX) {
+      truncateSync(LOG, 0);
+      log(`log truncated at ${LOG_MAX / 1024 / 1024}MB`);
+    }
+  } catch {}
+}
 
 async function cycle(reason: string) {
   if (busy) return void (again = true);
@@ -502,23 +533,31 @@ async function cycle(reason: string) {
     // the sync, so a folder removed elsewhere is dropped from both sides of
     // the comparison instead of looking like a mass deletion.
     const rawBefore = listStore();
-    pushworkSync();
+    const t0 = Date.now();
+    await pushworkSync();
+    syncMs = Date.now() - t0;
     const entries = activeEntries();
     const names = new Set(entries.map((e) => e.name));
     const before = new Map([...rawBefore].filter(([k]) => under(k, names)));
     const after = listStore(names);
     const inn = importRemote(entries, before, after, base);
     writeFileSync(BASELINE, JSON.stringify(Object.fromEntries(listStore(names))));
-    if (out.length) log(`[${reason}] pushed ${summary(out)}`);
+    if (out.length) log(`[${reason}] pushed ${summary(out)} (pushwork ${(syncMs / 1000).toFixed(1)}s)`);
     if (inn.length) log(`[${reason}] pulled ${summary(inn)}`);
     rewatch(entries);
   } catch (e) {
     log(`[${reason}]`, (e as Error).message);
   } finally {
     busy = false;
+    capLog();
     if (again) {
       again = false;
       queueMicrotask(() => cycle("queued"));
+    } else if (daemonMode) {
+      // Poll once the daemon has been idle for POLL_MS, not on a fixed beat,
+      // so a slow sync never leaves it permanently busy and deaf to edits.
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(() => cycle("poll"), POLL_MS);
     }
   }
 }
@@ -577,8 +616,8 @@ async function daemon() {
   log(`localsync ${config.role}: ${config.endpoint}, ${activeEntries().length} folders, debounce ${DEBOUNCE_MS}ms, poll ${POLL_MS}ms`);
 
   rewatch(activeEntries());
+  daemonMode = true;
   await cycle("start");
-  setInterval(() => cycle("poll"), POLL_MS);
 }
 
 // ---------- CLI ----------
