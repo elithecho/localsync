@@ -94,8 +94,9 @@ effect one sync later.
 | `sync` | Run one sync now (daemon stopped) |
 
 Settings via environment: `LOCALSYNC_PORT` (18081), `LOCALSYNC_DEBOUNCE_MS`
-(2000), `LOCALSYNC_POLL_MS` (15000), `LOCALSYNC_PUSHWORK_TIMEOUT_MS` (120000),
-`LOCALSYNC_DIR` (`~/.localsync`).
+(2000), `LOCALSYNC_RESIDENT_POLL_MS` (60000), `LOCALSYNC_DIR` (`~/.localsync`).
+`LOCALSYNC_POLL_MS` (15000) and `LOCALSYNC_PUSHWORK_TIMEOUT_MS` (120000) apply
+when the daemon falls back to the pushwork CLI.
 
 ## How it works
 
@@ -103,9 +104,15 @@ Settings via environment: `LOCALSYNC_PORT` (18081), `LOCALSYNC_DEBOUNCE_MS`
   repo. It holds a copy of each folder under its name, plus the `registry` file
   that lists each name and its default path. Each machine's own paths live in
   `~/.localsync/paths.json`, which doesn't sync.
-- The daemon watches the registered folders and syncs 2s after the last change.
-  It also checks every 15s so it picks up the other machine's changes. Only
+- The daemon keeps the pushwork repo loaded. It watches the registered folders
+  and syncs 2s after the last change, and the other machine's changes arrive as
+  events within about a second. A change typically shows up on the other
+  machine 2–4s after you save it. A check every 60s is only a safety net. Only
   changed files are copied, and deletions sync too.
+- Each sync compares the folder with what was last written to disk, not with
+  the repo's live state. Otherwise a file still arriving from the other machine
+  would look like a local deletion. If one machine deletes a file while the
+  other edits it, the edit wins.
 - Default paths are relative to `~`, so `/Users/me/x` on a Mac and `/home/me/x`
   on Linux are the same folder with no `map` needed. Symlinks are stored as
   their targets, also relative to `~`.

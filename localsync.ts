@@ -23,6 +23,7 @@ import { connect } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import ignore, { type Ignore } from "ignore";
+import { openResident, type Resident } from "./resident.ts";
 
 const HOME = homedir();
 const DIR = process.env.LOCALSYNC_DIR ?? join(HOME, ".localsync");
@@ -43,6 +44,9 @@ const SUBDUCTION_RELEASE = "v0.22.0-nightly.2026-11-26";
 const PORT = Number(process.env.LOCALSYNC_PORT ?? 18081);
 const DEBOUNCE_MS = Number(process.env.LOCALSYNC_DEBOUNCE_MS ?? 2000);
 const POLL_MS = Number(process.env.LOCALSYNC_POLL_MS ?? 15000);
+// With pushwork loaded, incoming changes arrive as events; polling is only a safety net.
+const RESIDENT_POLL_MS = Number(process.env.LOCALSYNC_RESIDENT_POLL_MS ?? 60000);
+const REMOTE_DEBOUNCE_MS = 300;
 const PUSHWORK_TIMEOUT_MS = Number(process.env.LOCALSYNC_PUSHWORK_TIMEOUT_MS ?? 120000);
 const LABEL = "dev.localsync";
 const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
@@ -573,7 +577,8 @@ async function cycle(reason: string) {
     // the comparison instead of looking like a mass deletion.
     const rawBefore = listStore();
     const t0 = Date.now();
-    await pushworkSync();
+    if (daemonMode) await residentSync();
+    else await pushworkSync();
     syncMs = Date.now() - t0;
     const entries = activeEntries();
     loadRules(entries); // the sync may have brought a new .syncignore
@@ -597,7 +602,7 @@ async function cycle(reason: string) {
       // Poll once the daemon has been idle for POLL_MS, not on a fixed beat,
       // so a slow sync never leaves it permanently busy and deaf to edits.
       clearTimeout(pollTimer);
-      pollTimer = setTimeout(() => cycle("poll"), POLL_MS);
+      pollTimer = setTimeout(() => cycle("poll"), resident ? RESIDENT_POLL_MS : POLL_MS);
     }
   }
 }
@@ -606,6 +611,34 @@ async function cycle(reason: string) {
 
 const watchers = new Map<string, FSWatcher>();
 let timer: ReturnType<typeof setTimeout> | undefined;
+
+// ---------- resident pushwork (daemon only) ----------
+
+let resident: Resident | undefined;
+let remoteTimer: ReturnType<typeof setTimeout> | undefined;
+
+function onRemoteChange() {
+  clearTimeout(remoteTimer);
+  remoteTimer = setTimeout(() => cycle("remote"), REMOTE_DEBOUNCE_MS);
+}
+
+// Open on first use; after a failure, drop it so the next cycle reopens.
+async function residentSync() {
+  try {
+    if (!resident) {
+      const t0 = Date.now();
+      resident = await openResident({ root: STORE, pushworkDir: join(ROOT, "node_modules/pushwork/dist"), onRemoteChange });
+      log(`pushwork loaded (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+    }
+    const r = await resident.sync();
+    if (!r.synced) log("server did not confirm the sync yet; will retry");
+  } catch (e) {
+    const dead = resident;
+    resident = undefined;
+    await dead?.close().catch(() => {});
+    throw e;
+  }
+}
 
 function onChange() {
   clearTimeout(timer);
@@ -642,8 +675,15 @@ async function daemon() {
   const config = readConfig() ?? die("Not set up. Run `localsync start` (first machine) or `localsync repo add <url> <endpoint>`.");
   mkdirSync(DIR, { recursive: true });
   writeFileSync(PID, process.pid + "\n");
-  process.on("SIGTERM", () => process.exit(0));
-  process.on("SIGINT", () => process.exit(0));
+  // Close the resident repo first so pushwork finishes writing its storage.
+  const shutdown = async () => {
+    const stop = setTimeout(() => process.exit(0), 5000);
+    await resident?.close().catch(() => {});
+    clearTimeout(stop);
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
   process.on("SIGUSR1", () => cycle("registry")); // sent by add/rm/map
   process.on("exit", () => {
     try {
