@@ -42,6 +42,7 @@ const SUBDUCTION_RELEASE = "v0.22.0-nightly.2026-11-26";
 const PORT = Number(process.env.LOCALSYNC_PORT ?? 18081);
 const DEBOUNCE_MS = Number(process.env.LOCALSYNC_DEBOUNCE_MS ?? 2000);
 const POLL_MS = Number(process.env.LOCALSYNC_POLL_MS ?? 15000);
+const PUSHWORK_TIMEOUT_MS = Number(process.env.LOCALSYNC_PUSHWORK_TIMEOUT_MS ?? 120000);
 const LABEL = "dev.localsync";
 const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
 const SELF = import.meta.path;
@@ -232,6 +233,9 @@ async function superviseServer(ip: string, dns: string) {
   await ensureSubduction();
   let backoff = 1000;
   const startOne = async () => {
+    // Our readiness check is "the port answers", so a stale server (or anything
+    // else) on the port would pass it. Say so instead of looking healthy.
+    if (await portOpen(ip, PORT)) log(`port ${ip}:${PORT} is already in use by another process; not starting a second server`);
     const child = spawn(
       SUBDUCTION,
       ["server", "--key-file", SERVER_KEY, "--auth", "open", "--socket", `${ip}:${PORT}`, "--data-dir", SERVER_DATA, "--service-name", `${dns}:${PORT}`],
@@ -456,19 +460,28 @@ function importRemote(entries: Entry[], before: Listing, after: Listing, base: L
 }
 
 // pushwork is a pinned dependency of this checkout (package.json), so a clone
-// needs `bun install` and nothing global. PATH stays as the fallback.
-let pushworkPath = "";
-function pushworkBin() {
-  if (pushworkPath) return pushworkPath;
-  const local = join(ROOT, "node_modules/.bin/pushwork");
-  if (existsSync(local)) return (pushworkPath = local);
+// needs `bun install` and nothing global. It runs under this same Bun, so no
+// Node.js is needed (its bin script says `#!/usr/bin/env node`). A pushwork
+// on PATH is the fallback.
+let pushworkCmd: string[] | undefined;
+function pushworkBin(): string[] {
+  if (pushworkCmd) return pushworkCmd;
+  const local = join(ROOT, "node_modules/pushwork/dist/cli.js");
+  if (existsSync(local)) return (pushworkCmd = [process.execPath, local]);
   const found = spawnSync("sh", ["-c", "command -v pushwork"], { encoding: "utf8" }).stdout.trim();
-  if (found) return (pushworkPath = found);
-  die(`pushwork is not installed. Run \`bun install\` in ${ROOT}.`);
+  if (found) return (pushworkCmd = [found]);
+  return die(`pushwork is not installed. Run \`bun install\` in ${ROOT}.`);
+}
+
+function runPushwork(args: string[], cwd = STORE) {
+  const [cmd, ...pre] = pushworkBin();
+  // Bounded: signals (stop) are only handled between syncs, and an unreachable
+  // server must not wedge the daemon.
+  return spawnSync(cmd, [...pre, ...args], { cwd, encoding: "utf8", env: process.env, timeout: PUSHWORK_TIMEOUT_MS });
 }
 
 function pushworkSync() {
-  const r = spawnSync(pushworkBin(), ["--quiet", "sync"], { cwd: STORE, encoding: "utf8", env: process.env });
+  const r = runPushwork(["--quiet", "sync"]);
   if (r.status !== 0) throw new Error(`pushwork sync failed (${r.status ?? r.error?.message}): ${`${r.stdout ?? ""}${r.stderr ?? ""}`.trim()}`);
 }
 
@@ -548,13 +561,13 @@ function rewatch(entries: Entry[]) {
 async function daemon() {
   const config = readConfig() ?? die("Not set up. Run `localsync start` (first machine) or `localsync repo add <url> <endpoint>`.");
   mkdirSync(DIR, { recursive: true });
-  writeFileSync(PID, String(process.pid));
+  writeFileSync(PID, process.pid + "\n");
   process.on("SIGTERM", () => process.exit(0));
   process.on("SIGINT", () => process.exit(0));
   process.on("SIGUSR1", () => cycle("registry")); // sent by add/rm/map
   process.on("exit", () => {
     try {
-      if (readFileSync(PID, "utf8") === String(process.pid)) rmSync(PID);
+      if (readFileSync(PID, "utf8").trim() === String(process.pid)) rmSync(PID);
     } catch {}
   });
 
@@ -582,7 +595,7 @@ function daemonPid(): number | undefined {
 const uid = () => process.getuid?.() ?? 0;
 
 function pushwork(args: string[], cwd = STORE) {
-  const r = spawnSync(pushworkBin(), args, { cwd, encoding: "utf8", env: process.env });
+  const r = runPushwork(args, cwd);
   if (r.status !== 0) die(`pushwork ${args.join(" ")} failed: ${`${r.stdout ?? ""}${r.stderr ?? ""}`.trim()}`);
   return r.stdout.trim();
 }

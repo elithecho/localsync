@@ -13,10 +13,13 @@ On every machine:
 
 - Tailscale, logged in to the same tailnet
 - [Bun](https://bun.sh)
-- pushwork: `bun install -g pushwork`
+
+pushwork comes pinned in `package.json` and runs under Bun, so you don't need
+Node.js or a global install.
 
 ```sh
 git clone https://github.com/elithecho/localsync.git ~/Workspace/localsync
+cd ~/Workspace/localsync && bun install
 ln -s ~/Workspace/localsync/bin/localsync ~/.local/bin/localsync
 ```
 
@@ -74,7 +77,8 @@ machine.
 | `sync` | Run one sync now (daemon stopped) |
 
 Settings via environment: `LOCALSYNC_PORT` (18081), `LOCALSYNC_DEBOUNCE_MS`
-(2000), `LOCALSYNC_POLL_MS` (15000), `LOCALSYNC_DIR` (`~/.localsync`).
+(2000), `LOCALSYNC_POLL_MS` (15000), `LOCALSYNC_PUSHWORK_TIMEOUT_MS` (120000),
+`LOCALSYNC_DIR` (`~/.localsync`).
 
 ## How it works
 
@@ -116,11 +120,11 @@ Don't sync folders that hold secrets you wouldn't want on every device.
 
 ## Dependencies
 
-Neither is bundled. localsync runs whatever you have installed.
+Neither is vendored into this repo. `bun install` fetches pushwork, and the host downloads Subduction on first start.
 
 | Dependency | How it's used | License |
 | --- | --- | --- |
-| [pushwork](https://www.npmjs.com/package/pushwork) | You install it; localsync runs its CLI | MIT OR Apache-2.0 |
+| [pushwork](https://www.npmjs.com/package/pushwork) | npm dependency pinned to `2.2.3` (`bun install`). localsync runs its CLI under Bun | MIT OR Apache-2.0 |
 | [Subduction](https://github.com/inkandswitch/subduction) | The host downloads a pinned nightly (`v0.22.0-nightly.2026-11-26`) to `~/.local/bin/subduction` | MIT OR Apache-2.0 |
 
 ## License
