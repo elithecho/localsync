@@ -27,8 +27,12 @@ ln -s ~/Workspace/localsync/bin/localsync ~/.local/bin/localsync
 ```sh
 localsync start
 localsync add ~/.claude/skills ~/notes
+localsync add ~/Workspace/app/.scratch --as app-scratch
 localsync repo
 ```
+
+Each folder gets a name: `--as`, or one made from the path (`claude-skills`,
+`notes`).
 
 `localsync start` reads this machine's Tailscale name and serves on
 `ws://<machine>.<tailnet>.ts.net:18081`. That address listens on the tailnet
@@ -41,9 +45,18 @@ to run on the other machine.
 localsync repo add automerge:... ws://<machine-a>.<tailnet>.ts.net:18081
 ```
 
-B pulls every registered folder into the same place under its own home, then
-keeps syncing. From then on either machine can `add` or `rm` folders, because
-the list of folders syncs too.
+B pulls every folder to the same path under its own home, then keeps syncing.
+If B keeps a folder somewhere else, point the name at it. That's best done
+before B's first sync:
+
+```sh
+localsync map app-scratch ~/code/app/.scratch   # this machine only
+localsync map notes --skip                      # don't sync this one here
+```
+
+From then on either machine can `add` or `rm` folders, because the list of
+folders syncs too. `localsync ls` shows each folder and where it lives on this
+machine.
 
 ## Commands
 
@@ -51,9 +64,11 @@ the list of folders syncs too.
 | --- | --- |
 | `start` / `stop` / `restart` | Run the daemon. macOS: launchd, restarts at login. Linux/WSL: background process |
 | `status` / `logs` | Show state, or follow the log |
-| `add <path>...` | Sync these paths (must be inside `~`) |
-| `rm <path>...` | Stop syncing. Files stay on every machine |
-| `ls` | List registered paths |
+| `add <path> [--as <name>]` | Sync a folder inside `~` under a name |
+| `map <name> <path>` | Keep that folder at a different path on this machine |
+| `map <name> --skip` / `--default` | Don't sync it here / go back to the shared path |
+| `rm <name\|path>...` | Stop syncing. Files stay on every machine |
+| `ls` | Folders, and where each lives on this machine |
 | `repo` | Print the join command for another machine |
 | `repo add <url> <endpoint>` | Join a host and start syncing |
 | `sync` | Run one sync now (daemon stopped) |
@@ -64,14 +79,20 @@ Settings via environment: `LOCALSYNC_PORT` (18081), `LOCALSYNC_DEBOUNCE_MS`
 ## How it works
 
 - `~/.localsync/store/` is one [pushwork](https://www.npmjs.com/package/pushwork)
-  repo. It holds a copy of each registered folder, plus the `registry` file that
-  lists them.
+  repo. It holds a copy of each folder under its name, plus the `registry` file
+  that lists each name and its default path. Each machine's own paths live in
+  `~/.localsync/paths.json`, which doesn't sync.
 - The daemon watches the registered folders and syncs 2s after the last change.
   It also checks every 15s so it picks up the other machine's changes. Only
   changed files are copied, and deletions sync too.
-- Paths are stored relative to `~`, so `/Users/me/x` on a Mac and `/home/me/x`
-  on Linux are the same folder. Symlinks are stored as their targets, also
-  relative to `~`.
+- Default paths are relative to `~`, so `/Users/me/x` on a Mac and `/home/me/x`
+  on Linux are the same folder with no `map` needed. Symlinks are stored as
+  their targets, also relative to `~`.
+- When a folder first syncs on a machine (joining, a new `add`, or a `map` to a
+  new path), the shared copy wins. Local-only files go up, and differing local
+  files are backed up and replaced. Nothing is deleted on that first sync.
+- Folders can't be nested inside each other. If two overlap on a machine, the
+  one added later is ignored there until it's remapped.
 - If an incoming change would overwrite a local edit that hasn't synced yet,
   the local copy goes to `~/.localsync/backup/` first.
 - `.git`, `node_modules`, `.DS_Store` and `*.tmp` are skipped.
@@ -91,8 +112,7 @@ Don't sync folders that hold secrets you wouldn't want on every device.
 - Only the host runs the server. If it's asleep, nothing syncs until it wakes.
 - Each file keeps its edit history, so large or fast-changing files (build
   output, binaries) make the store grow. Sync text-like folders.
-- Every machine syncs every registered folder. Choosing per machine isn't
-  supported yet.
+- Every machine syncs every folder unless it runs `map <name> --skip`.
 
 ## Dependencies
 

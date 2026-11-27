@@ -1,0 +1,11 @@
+{
+  "name": "localsync",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sync folders between your machines over Tailscale",
+  "license": "MIT",
+  "dependencies": {
+    "pushwork": "2.2.3"
+  }
+}

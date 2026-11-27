@@ -4,6 +4,10 @@
 //
 //   machine A: localsync start; localsync add ~/x; localsync repo
 //   machine B: localsync repo add <automerge-url> <ws-endpoint>
+//              localsync map <name> ~/elsewhere   (only if B keeps it at another path)
+//
+// Each synced folder has a name. The shared registry maps name -> the path it
+// had on the machine that added it; any machine can map a name to its own path.
 //
 // One cycle = export (files changed under ~ since the last cycle -> store)
 // -> pushwork sync (store <-> peers) -> import (files pushwork changed -> ~).
@@ -22,9 +26,10 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 const HOME = homedir();
 const DIR = process.env.LOCALSYNC_DIR ?? join(HOME, ".localsync");
 const STORE = join(DIR, "store"); // the pushwork repo
-const FILES = join(STORE, "files"); // mirrored files, keyed by path relative to ~
-const REGISTRY = join(STORE, "registry"); // one ~-relative path per line; synced
-const OPS = join(DIR, "registry.ops"); // add/rm queued for the daemon (never write the store mid-sync)
+const FILES = join(STORE, "files"); // mirrored files, keyed by folder name
+const REGISTRY = join(STORE, "registry"); // "name<TAB>default path" per line; synced
+const PATHS = join(DIR, "paths.json"); // this machine's overrides: name -> path relative to ~, or null to skip
+const OPS = join(DIR, "registry.ops"); // add/rm/map queued for the daemon (never write the store mid-sync)
 const CONFIG = join(DIR, "config.json");
 const BASELINE = join(DIR, "baseline.json");
 const BACKUP = join(DIR, "backup");
@@ -40,6 +45,7 @@ const POLL_MS = Number(process.env.LOCALSYNC_POLL_MS ?? 15000);
 const LABEL = "dev.localsync";
 const PLIST = join(HOME, "Library/LaunchAgents", `${LABEL}.plist`);
 const SELF = import.meta.path;
+const ROOT = dirname(SELF); // the checkout this file lives in
 const LINK = ".localsync-link"; // pushwork follows symlinks, so a link is stored as a file holding its target
 const TMP = ".localsync-tmp";
 
@@ -66,37 +72,97 @@ function writeConfig(c: Config) {
 
 // ---------- registry ----------
 
-function readRegistry(): string[] {
-  if (!existsSync(REGISTRY)) return [];
-  const lines = readFileSync(REGISTRY, "utf8").split("\n").map((l) => l.trim());
-  return [...new Set(lines.filter((l) => l && !l.startsWith("#")))];
+type Registry = Map<string, string>; // name -> default path relative to ~
+type PathMap = Record<string, string | null>; // name -> local path, null = skip here
+type Entry = { name: string; rel: string }; // a folder active on this machine
+
+function readRegistry(): Registry {
+  const reg: Registry = new Map();
+  if (!existsSync(REGISTRY)) return reg;
+  for (const line of readFileSync(REGISTRY, "utf8").split("\n")) {
+    const [name, rel] = line.trim().split("\t");
+    if (name && rel && !name.startsWith("#")) reg.set(name, rel);
+  }
+  return reg;
 }
 
-function writeRegistry(paths: string[]) {
-  writeFileSync(REGISTRY, paths.join("\n") + (paths.length ? "\n" : ""));
+function writeRegistry(reg: Registry) {
+  writeFileSync(REGISTRY, [...reg].map(([n, r]) => `${n}\t${r}\n`).join(""));
 }
 
-// Registry edits from the CLI are queued as "+rel"/"-rel" lines while the
-// daemon runs, because pushwork would overwrite a file changed mid-sync.
-function withOps(paths: string[], file = OPS): string[] {
-  if (!existsSync(file)) return paths;
-  const out = [...paths];
-  for (const line of readFileSync(file, "utf8").split("\n")) {
-    const rel = line.slice(1).trim();
+function readPaths(): PathMap {
+  try {
+    return JSON.parse(readFileSync(PATHS, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writePaths(m: PathMap) {
+  mkdirSync(DIR, { recursive: true });
+  writeFileSync(PATHS, JSON.stringify(m, null, 2) + "\n");
+}
+
+// CLI edits are queued as tab-separated op lines while the daemon runs,
+// because pushwork would overwrite a registry file changed mid-sync:
+//   + name rel   add      - name   remove
+//   m name rel   map here s name   skip here   d name   back to default
+function foldOps(reg: Registry, paths: PathMap, file = OPS) {
+  const remapped = new Set<string>();
+  if (existsSync(file)) {
+    for (const line of readFileSync(file, "utf8").split("\n")) {
+      const [op, name, rel] = line.split("\t");
+      if (!name) continue;
+      if (op === "+" && rel) reg.set(name, rel);
+      else if (op === "-") reg.delete(name), delete paths[name];
+      else if (op === "m" && rel) (paths[name] = rel), remapped.add(name);
+      else if (op === "s") (paths[name] = null), remapped.add(name);
+      else if (op === "d") delete paths[name], remapped.add(name);
+    }
+  }
+  return { reg, paths, remapped };
+}
+
+// Registry and local paths as the CLI should see them, queued edits included.
+const effective = () => foldOps(readRegistry(), readPaths());
+
+const overlaps = (a: string, b: string) => a === b || a.startsWith(b + "/") || b.startsWith(a + "/");
+const warned = new Set<string>();
+
+// Folders that sync on this machine. Nested folders would copy the same files
+// under two names, so a folder overlapping an earlier one is ignored (and
+// reported) until it's remapped. Registry order is the same on every machine.
+function activeEntries(reg = readRegistry(), paths = readPaths()): Entry[] {
+  const out: Entry[] = [];
+  for (const [name, def] of reg) {
+    const rel = name in paths ? paths[name] : def;
     if (!rel) continue;
-    if (line[0] === "+" && !out.includes(rel)) out.push(rel);
-    const i = out.indexOf(rel);
-    if (line[0] === "-" && i >= 0) out.splice(i, 1);
+    const clash = out.find((e) => overlaps(e.rel, rel));
+    if (clash) {
+      const msg = `ignoring "${name}": ~/${rel} overlaps "${clash.name}" (~/${clash.rel}); fix with: localsync map ${name} <path>`;
+      if (!warned.has(msg)) warned.add(msg), log(msg);
+      continue;
+    }
+    out.push({ name, rel });
   }
   return out;
 }
 
-// Daemon side: fold queued edits into the store's registry between syncs.
+// Daemon side: fold queued edits in between syncs. A folder whose local path
+// changed starts over as "fresh" so the new location can't look like a mass
+// deletion of the old one.
 function applyOps() {
   if (!existsSync(OPS)) return;
   const taking = OPS + ".taking";
   renameSync(OPS, taking); // a concurrent CLI append lands in a fresh OPS file
-  writeRegistry(withOps(readRegistry(), taking));
+  const { reg, paths, remapped } = foldOps(readRegistry(), readPaths(), taking);
+  writeRegistry(reg);
+  writePaths(paths);
+  const base = loadBaseline();
+  if (base && remapped.size) {
+    for (const k of base.keys()) if (remapped.has(nameOf(k))) base.delete(k);
+    writeFileSync(BASELINE, JSON.stringify(Object.fromEntries(base)));
+  }
   rmSync(taking);
 }
 
@@ -108,7 +174,14 @@ function toRel(input: string): string {
   return rel;
 }
 
-const inScope = (rel: string, paths: string[]) => paths.some((p) => rel === p || rel.startsWith(p + "/"));
+// "Workspace/a440/paperbase/.scratch" -> "paperbase-scratch"
+function defaultName(rel: string) {
+  return rel.split("/").slice(-2).map((s) => s.replace(/^\.+/, "")).filter(Boolean).join("-").replace(/[^A-Za-z0-9._-]/g, "-") || "folder";
+}
+
+const validName = (n: string) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(n);
+const nameOf = (key: string) => key.split("/")[0];
+const under = (key: string, names: Set<string>) => names.has(nameOf(key));
 
 // ---------- tailnet ----------
 
@@ -205,17 +278,31 @@ function walk(root: string, rel: string, out: Listing, kind: "home" | "store") {
   }
 }
 
-function listHome(paths: string[]): Listing {
+// Keys are "<name>/<path inside the folder>" (or just "<name>" for a single file).
+function listHome(entries: Entry[]): Listing {
   const out: Listing = new Map();
-  for (const p of paths) walk(HOME, p, out, "home");
+  for (const e of entries) {
+    const tmp: Listing = new Map();
+    walk(HOME, e.rel, tmp, "home");
+    for (const [rel, v] of tmp) out.set(e.name + rel.slice(e.rel.length), v);
+  }
   return out;
 }
 
-// Everything in the store, or only what falls under `paths`.
-function listStore(paths?: string[]): Listing {
+// Key -> path relative to ~ on this machine (entries must contain the key's folder).
+let current: Entry[] = [];
+function homeRel(key: string) {
+  const name = nameOf(key);
+  const e = current.find((x) => x.name === name);
+  if (!e) throw new Error(`no local path for ${name}`);
+  return e.rel + key.slice(name.length);
+}
+
+// Everything in the store, or only the given folders.
+function listStore(names?: Set<string>): Listing {
   const out: Listing = new Map();
   walk(FILES, "", out, "store");
-  if (paths) for (const rel of out.keys()) if (!inScope(rel, paths)) out.delete(rel);
+  if (names) for (const k of out.keys()) if (!under(k, names)) out.delete(k);
   return out;
 }
 
@@ -268,7 +355,7 @@ function toStore(rel: string, v: string) {
   } else {
     removePath(dst + LINK);
     if (lstatSync(dst, { throwIfNoEntry: false })?.isDirectory()) removePath(dst);
-    atomicCopy(join(HOME, rel), dst);
+    atomicCopy(join(HOME, homeRel(rel)), dst);
   }
 }
 
@@ -279,7 +366,8 @@ function dropFromStore(rel: string) {
   }
 }
 
-function toHome(rel: string, v: string) {
+function toHome(key: string, v: string) {
+  const rel = homeRel(key);
   if (throughLink(HOME, rel)) return;
   const dst = join(HOME, rel);
   const cur = lstatSync(dst, { throwIfNoEntry: false });
@@ -290,11 +378,12 @@ function toHome(rel: string, v: string) {
     symlinkSync(untilde(v.slice(2)), dst);
   } else {
     if (cur?.isSymbolicLink()) removePath(dst);
-    atomicCopy(join(FILES, rel), dst);
+    atomicCopy(join(FILES, key), dst);
   }
 }
 
-function dropFromHome(rel: string) {
+function dropFromHome(key: string) {
+  const rel = homeRel(key);
   if (throughLink(HOME, rel)) return;
   const p = join(HOME, rel);
   removePath(p);
@@ -302,7 +391,8 @@ function dropFromHome(rel: string) {
 }
 
 let backupStamp = "";
-function backup(rel: string) {
+function backup(key: string) {
+  const rel = homeRel(key);
   const src = join(HOME, rel);
   if (!lstatSync(src, { throwIfNoEntry: false })) return;
   const dst = join(BACKUP, backupStamp, rel);
@@ -319,45 +409,66 @@ function loadBaseline(): Listing | undefined {
 
 const summary = (xs: string[]) => `${xs.length}: ${xs.slice(0, 5).join(", ")}${xs.length > 5 ? ", …" : ""}`;
 
-// ~ -> store: what changed locally since the baseline. With no baseline (first
-// run), only files the store lacks go out, and nothing is deleted.
-function exportLocal(paths: string[], base: Listing | undefined): string[] {
-  const local = listHome(paths);
+// A folder is "fresh" on this machine when the baseline knows none of its
+// files: first run, just added, just remapped. For a fresh folder the store
+// wins: only files the store lacks go out, differing local files are backed
+// up and replaced, and nothing is deleted.
+const baseNames = (base: Listing) => new Set([...base.keys()].map(nameOf));
+
+// ~ -> store: what changed locally since the baseline.
+function exportLocal(entries: Entry[], base: Listing): string[] {
+  current = entries;
+  const names = new Set(entries.map((e) => e.name));
+  const known = baseNames(base);
+  const local = listHome(entries);
+  const store = listStore(names);
   const changed: string[] = [];
-  if (!base) {
-    const store = listStore(paths);
-    for (const [rel, v] of local) if (!store.has(rel)) (toStore(rel, v), changed.push(rel));
-    return changed;
+  for (const [k, v] of local) {
+    const push = known.has(nameOf(k)) ? base.get(k) !== v : !store.has(k);
+    if (push) (toStore(k, v), changed.push(k));
   }
-  for (const [rel, v] of local) if (base.get(rel) !== v && inScope(rel, paths)) (toStore(rel, v), changed.push(rel));
-  for (const rel of base.keys()) if (inScope(rel, paths) && !local.has(rel)) (dropFromStore(rel), changed.push("-" + rel));
+  for (const k of base.keys()) if (under(k, names) && !local.has(k)) (dropFromStore(k), changed.push("-" + k));
   return changed;
 }
 
-// store -> ~: what pushwork changed (or, on a first run, anything that differs).
-// A local file that would be overwritten while holding an unsynced edit is backed up first.
-function importRemote(paths: string[], before: Listing, after: Listing, firstRun: boolean): string[] {
-  const local = listHome(paths);
+// store -> ~: what pushwork changed, plus anything that differs in a fresh folder.
+// A local file holding an unsynced edit is backed up before it's replaced.
+function importRemote(entries: Entry[], before: Listing, after: Listing, base: Listing): string[] {
+  current = entries;
+  const known = baseNames(base);
+  const local = listHome(entries);
   const changed: string[] = [];
   backupStamp = new Date().toISOString().replace(/[:.]/g, "-");
-  for (const [rel, v] of after) {
-    if (local.get(rel) === v) continue;
-    if (!firstRun && before.get(rel) === v) continue;
-    if (local.has(rel) && local.get(rel) !== before.get(rel)) backup(rel);
-    toHome(rel, v);
-    changed.push(rel);
+  for (const [k, v] of after) {
+    if (local.get(k) === v) continue;
+    if (known.has(nameOf(k)) && before.get(k) === v) continue;
+    if (local.has(k) && local.get(k) !== before.get(k)) backup(k);
+    toHome(k, v);
+    changed.push(k);
   }
-  for (const [rel, v] of before) {
-    if (after.has(rel) || !local.has(rel)) continue;
-    if (local.get(rel) !== v) backup(rel);
-    dropFromHome(rel);
-    changed.push("-" + rel);
+  for (const [k, v] of before) {
+    if (after.has(k) || !local.has(k)) continue;
+    if (local.get(k) !== v) backup(k);
+    dropFromHome(k);
+    changed.push("-" + k);
   }
   return changed;
+}
+
+// pushwork is a pinned dependency of this checkout (package.json), so a clone
+// needs `bun install` and nothing global. PATH stays as the fallback.
+let pushworkPath = "";
+function pushworkBin() {
+  if (pushworkPath) return pushworkPath;
+  const local = join(ROOT, "node_modules/.bin/pushwork");
+  if (existsSync(local)) return (pushworkPath = local);
+  const found = spawnSync("sh", ["-c", "command -v pushwork"], { encoding: "utf8" }).stdout.trim();
+  if (found) return (pushworkPath = found);
+  die(`pushwork is not installed. Run \`bun install\` in ${ROOT}.`);
 }
 
 function pushworkSync() {
-  const r = spawnSync("pushwork", ["--quiet", "sync"], { cwd: STORE, encoding: "utf8", env: process.env });
+  const r = spawnSync(pushworkBin(), ["--quiet", "sync"], { cwd: STORE, encoding: "utf8", env: process.env });
   if (r.status !== 0) throw new Error(`pushwork sync failed (${r.status ?? r.error?.message}): ${`${r.stdout ?? ""}${r.stderr ?? ""}`.trim()}`);
 }
 
@@ -370,24 +481,24 @@ async function cycle(reason: string) {
   try {
     mkdirSync(FILES, { recursive: true });
     applyOps();
-    const base = loadBaseline();
-    const out = exportLocal(readRegistry(), base);
+    const base = loadBaseline() ?? new Map();
+    const out = exportLocal(activeEntries(), base);
     // A watch event with nothing new (e.g. our own import) needs no network trip.
     if (reason === "watch" && out.length === 0) return;
     // Snapshot the whole store, then scope it with the registry as it is after
-    // the sync, so a path removed elsewhere is dropped from both sides of the
-    // comparison instead of looking like a mass deletion.
+    // the sync, so a folder removed elsewhere is dropped from both sides of
+    // the comparison instead of looking like a mass deletion.
     const rawBefore = listStore();
     pushworkSync();
-    const paths = readRegistry();
-    const scope = (l: Listing) => new Map([...l].filter(([rel]) => inScope(rel, paths)));
-    const before = scope(rawBefore);
-    const after = listStore(paths);
-    const inn = importRemote(paths, before, after, !base);
-    writeFileSync(BASELINE, JSON.stringify(Object.fromEntries(listStore(paths))));
+    const entries = activeEntries();
+    const names = new Set(entries.map((e) => e.name));
+    const before = new Map([...rawBefore].filter(([k]) => under(k, names)));
+    const after = listStore(names);
+    const inn = importRemote(entries, before, after, base);
+    writeFileSync(BASELINE, JSON.stringify(Object.fromEntries(listStore(names))));
     if (out.length) log(`[${reason}] pushed ${summary(out)}`);
     if (inn.length) log(`[${reason}] pulled ${summary(inn)}`);
-    rewatch(paths);
+    rewatch(entries);
   } catch (e) {
     log(`[${reason}]`, (e as Error).message);
   } finally {
@@ -411,10 +522,10 @@ function onChange() {
 
 // One watcher per registered path; a file is watched through its parent so
 // atomic rename-writes still fire. exportLocal() decides what really changed.
-function rewatch(paths: string[]) {
-  for (const [p, w] of watchers) if (!paths.some((rel) => join(HOME, rel) === p)) (w.close(), watchers.delete(p));
-  for (const rel of paths) {
-    const p = join(HOME, rel);
+function rewatch(entries: Entry[]) {
+  const want = new Set(entries.map((e) => join(HOME, e.rel)));
+  for (const [p, w] of watchers) if (!want.has(p)) (w.close(), watchers.delete(p));
+  for (const p of want) {
     if (watchers.has(p) || !existsSync(p)) continue;
     const isDir = statSync(p).isDirectory();
     const only = isDir ? undefined : basename(p);
@@ -440,7 +551,7 @@ async function daemon() {
   writeFileSync(PID, String(process.pid));
   process.on("SIGTERM", () => process.exit(0));
   process.on("SIGINT", () => process.exit(0));
-  process.on("SIGUSR1", () => cycle("registry")); // sent by add/rm
+  process.on("SIGUSR1", () => cycle("registry")); // sent by add/rm/map
   process.on("exit", () => {
     try {
       if (readFileSync(PID, "utf8") === String(process.pid)) rmSync(PID);
@@ -450,9 +561,9 @@ async function daemon() {
   process.env.PUSHWORK_SUBDUCTION_SERVER = config.endpoint;
   if (config.role === "host") await superviseServer(config.ip, config.dns);
   if (!existsSync(join(STORE, ".pushwork/config.json"))) die(`No pushwork store at ${STORE}.`);
-  log(`localsync ${config.role}: ${config.endpoint}, ${readRegistry().length} paths, debounce ${DEBOUNCE_MS}ms, poll ${POLL_MS}ms`);
+  log(`localsync ${config.role}: ${config.endpoint}, ${activeEntries().length} folders, debounce ${DEBOUNCE_MS}ms, poll ${POLL_MS}ms`);
 
-  rewatch(readRegistry());
+  rewatch(activeEntries());
   await cycle("start");
   setInterval(() => cycle("poll"), POLL_MS);
 }
@@ -471,7 +582,7 @@ function daemonPid(): number | undefined {
 const uid = () => process.getuid?.() ?? 0;
 
 function pushwork(args: string[], cwd = STORE) {
-  const r = spawnSync("pushwork", args, { cwd, encoding: "utf8", env: process.env });
+  const r = spawnSync(pushworkBin(), args, { cwd, encoding: "utf8", env: process.env });
   if (r.status !== 0) die(`pushwork ${args.join(" ")} failed: ${`${r.stdout ?? ""}${r.stderr ?? ""}`.trim()}`);
   return r.stdout.trim();
 }
@@ -481,7 +592,7 @@ function setupHost() {
   const self = tailnetSelf() ?? die("Tailscale is not running here. To join another machine instead, use `localsync repo add <url> <endpoint>`.");
   const endpoint = `ws://${self.dns}:${PORT}`;
   mkdirSync(FILES, { recursive: true });
-  if (!existsSync(REGISTRY)) writeRegistry([]);
+  if (!existsSync(REGISTRY)) writeRegistry(new Map());
   process.env.PUSHWORK_SUBDUCTION_SERVER = endpoint;
   if (!existsSync(join(STORE, ".pushwork/config.json"))) pushwork(["--quiet", "init"]); // works offline
   writeConfig({ role: "host", ip: self.ip, dns: self.dns, endpoint });
@@ -538,37 +649,66 @@ async function stop() {
   console.log(pid ? `Stopped (pid ${pid})` : "Not running");
 }
 
-// Daemon running: queue the edit and wake it. Otherwise write the store directly.
-function editRegistry(op: "+" | "-", rel: string, next: string[]) {
+// Daemon running: queue the edit and wake it. Otherwise apply it right away.
+function edit(...fields: string[]) {
+  mkdirSync(DIR, { recursive: true });
+  writeFileSync(OPS, fields.join("\t") + "\n", { flag: "a" });
   const pid = daemonPid();
-  if (!pid) return writeRegistry(next);
-  writeFileSync(OPS, `${op}${rel}\n`, { flag: "a" });
-  process.kill(pid, "SIGUSR1");
+  if (pid) process.kill(pid, "SIGUSR1");
+  else if (existsSync(join(STORE, ".pushwork/config.json"))) applyOps();
 }
 
 function requireStore() {
   if (!existsSync(join(STORE, ".pushwork/config.json"))) die("Not set up. Run `localsync start` or `localsync repo add <url> <endpoint>` first.");
 }
 
-function add(input: string) {
+// Local folders other than `except`, to refuse nested or overlapping paths.
+function overlap(rel: string, except?: string) {
+  const { reg, paths } = effective();
+  return activeEntries(reg, paths).find((e) => e.name !== except && overlaps(e.rel, rel));
+}
+
+function add(input: string, as?: string) {
   requireStore();
   const rel = toRel(input);
   if (!lstatSync(join(HOME, rel), { throwIfNoEntry: false })) die(`Not found: ${input}`);
-  const paths = withOps(readRegistry());
-  if (paths.includes(rel)) return console.log(`Already syncing ~/${rel}`);
-  const clash = paths.find((p) => rel.startsWith(p + "/") || p.startsWith(rel + "/"));
-  if (clash) die(`~/${rel} overlaps ~/${clash}, which is already registered.`);
-  editRegistry("+", rel, [...paths, rel]);
-  console.log(`Syncing ~/${rel}`);
+  const name = as ?? defaultName(rel);
+  if (!validName(name)) die(`Bad name "${name}": use letters, digits, ".", "_" or "-".`);
+  const { reg } = effective();
+  if (reg.has(name)) die(`"${name}" is already synced. Pick another name with --as, or point it here with: localsync map ${name} ${tilde(join(HOME, rel))}`);
+  const clash = overlap(rel);
+  if (clash) die(`~/${rel} overlaps "${clash.name}" (~/${clash.rel}).`);
+  edit("+", name, rel);
+  console.log(`Syncing ~/${rel} as "${name}"`);
+}
+
+// A name, or a local path that some folder is mapped to.
+function resolveName(input: string) {
+  const { reg, paths } = effective();
+  if (reg.has(input)) return input;
+  const rel = toRel(input);
+  return activeEntries(reg, paths).find((e) => e.rel === rel)?.name ?? die(`Not synced: ${input}`);
 }
 
 function rm(input: string) {
   requireStore();
-  const rel = toRel(input);
-  const paths = withOps(readRegistry());
-  if (!paths.includes(rel)) die(`Not registered: ~/${rel}`);
-  editRegistry("-", rel, paths.filter((p) => p !== rel));
-  console.log(`Stopped syncing ~/${rel} (files stay on every machine)`);
+  const name = resolveName(input);
+  edit("-", name);
+  console.log(`Stopped syncing "${name}" (files stay on every machine)`);
+}
+
+function map(name?: string, target?: string) {
+  requireStore();
+  if (!name || !target) return die("usage: localsync map <name> <path> | --skip | --default");
+  const { reg } = effective();
+  if (!reg.has(name)) die(`No synced folder named "${name}". See \`localsync ls\`.`);
+  if (target === "--skip") return edit("s", name), console.log(`"${name}" won't sync on this machine`);
+  const rel = target === "--default" ? reg.get(name)! : toRel(target);
+  const clash = overlap(rel, name);
+  if (clash) die(`~/${rel} overlaps "${clash.name}" (~/${clash.rel}).`);
+  if (target === "--default") edit("d", name);
+  else edit("m", name, rel);
+  console.log(`"${name}" syncs to ~/${rel} on this machine`);
 }
 
 function repoAdd(url?: string, endpoint?: string) {
@@ -580,7 +720,8 @@ function repoAdd(url?: string, endpoint?: string) {
   console.log("Cloning…");
   pushwork(["--quiet", "clone", url, STORE], DIR);
   writeConfig({ role: "peer", endpoint });
-  console.log(`Joined. Paths: ${readRegistry().map((p) => "~/" + p).join(", ") || "(none yet)"}`);
+  console.log(`Joined. Folders: ${[...readRegistry()].map(([n, r]) => `${n} (~/${r})`).join(", ") || "(none yet)"}`);
+  console.log("If one lives elsewhere on this machine: localsync map <name> <path>");
   start();
 }
 
@@ -602,7 +743,7 @@ switch (cmd) {
     console.log(pid ? `Running (pid ${pid})` : "Not running");
     console.log(`Role     ${c?.role ?? "(not set up)"}`);
     console.log(`Endpoint ${c?.endpoint ?? "-"}`);
-    console.log(`Paths    ${readRegistry().length}`);
+    console.log(`Folders  ${activeEntries().length} syncing here, ${readRegistry().size} total`);
     console.log(`Log      ${LOG}`);
     break;
   }
@@ -612,17 +753,32 @@ switch (cmd) {
   case "run":
     await daemon();
     break;
-  case "add":
-    if (!args.length) die("usage: localsync add <path>...");
-    for (const a of args) add(a);
+  case "add": {
+    const i = args.indexOf("--as");
+    const as = i >= 0 ? args.splice(i, 2)[1] : undefined;
+    if (!args.length || (i >= 0 && !as)) die("usage: localsync add <path>... | localsync add <path> --as <name>");
+    if (as && args.length > 1) die("--as names one folder; add the others separately.");
+    for (const a of args) add(a, as);
     break;
+  }
   case "rm":
-    if (!args.length) die("usage: localsync rm <path>...");
+    if (!args.length) die("usage: localsync rm <name|path>...");
     for (const a of args) rm(a);
     break;
-  case "ls":
-    for (const p of withOps(readRegistry())) console.log(`~/${p}${existsSync(join(HOME, p)) ? "" : "  (not here yet)"}`);
+  case "map":
+    map(args[0], args[1]);
     break;
+  case "ls": {
+    const { reg, paths } = effective();
+    const active = new Set(activeEntries(reg, paths).map((e) => e.name));
+    for (const [name, def] of reg) {
+      const rel = name in paths ? paths[name] : def;
+      const how = rel === null ? "skipped here" : !active.has(name) ? "IGNORED: overlaps another folder" : name in paths ? "mapped here" : "";
+      const missing = rel && !existsSync(join(HOME, rel)) ? "not here yet" : "";
+      console.log([name.padEnd(24), rel ? `~/${rel}` : "-", [how, missing].filter(Boolean).join(", ")].join("  ").trimEnd());
+    }
+    break;
+  }
   case "repo":
     if (args[0] === "add") repoAdd(args[1], args[2]);
     else {
@@ -644,9 +800,11 @@ switch (cmd) {
   localsync start              Start the daemon (first machine: becomes the host)
   localsync stop | restart     Stop / restart it (macOS: launchd, survives login)
   localsync status | logs      State, or follow the log
-  localsync add <path>...      Sync these paths (must be inside ~)
-  localsync rm <path>...       Stop syncing (files stay where they are)
-  localsync ls                 Registered paths
+  localsync add <path> [--as <name>]   Sync a folder (inside ~) under a name
+  localsync map <name> <path>  Keep that folder at a different path on this machine
+  localsync map <name> --skip | --default   Don't sync it here / use the shared path
+  localsync rm <name|path>...  Stop syncing (files stay where they are)
+  localsync ls                 Folders, and where each lives on this machine
   localsync repo               Print the command to run on the other machine
   localsync repo add <url> <endpoint>   Join a host and start syncing
   localsync sync               One cycle now (daemon stopped)
