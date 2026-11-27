@@ -16,7 +16,7 @@ On every machine:
 - pushwork: `bun install -g pushwork`
 
 ```sh
-git clone <this repo> ~/Workspace/localsync
+git clone https://github.com/elithecho/localsync.git ~/Workspace/localsync
 ln -s ~/Workspace/localsync/bin/localsync ~/.local/bin/localsync
 ```
 
