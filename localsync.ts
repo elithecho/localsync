@@ -572,7 +572,7 @@ function rm(input: string) {
 }
 
 function repoAdd(url?: string, endpoint?: string) {
-  if (!url?.startsWith("automerge:") || !endpoint?.startsWith("ws")) die("usage: localsync repo add <automerge:...> <ws://host:port>");
+  if (!url?.startsWith("automerge:") || !endpoint?.startsWith("ws")) return die("usage: localsync repo add <automerge:...> <ws://host:port>");
   if (readConfig()) die(`Already set up (${CONFIG}). Remove ${DIR} to start over.`);
   if (existsSync(STORE) && readdirSync(STORE).length) die(`${STORE} is not empty.`);
   process.env.PUSHWORK_SUBDUCTION_SERVER = endpoint;
